@@ -6,6 +6,7 @@ from tkinter import ttk, filedialog, messagebox
 
 import pyautogui
 
+# Make PyAutoGUI as fast as possible (removes built-in per-call pauses)
 pyautogui.PAUSE = 0
 pyautogui.MINIMUM_DURATION = 0
 pyautogui.MINIMUM_SLEEP = 0
@@ -22,37 +23,50 @@ class MacroApp:
         self.root = root
         self.root.title("Simple Macro Recorder")
 
+        # State
         self.recording = False
-        self.events = []
+        self.events = []  # {"key": str, "delay": float(seconds)}
         self._last_time = None
         self._play_thread = None
         self._stop_playback = threading.Event()
 
+        # Inline editor state
         self._edit_entry = None
         self._edit_iid = None
 
+        # Options
         self.ignore_keys = {"f9", "f10", "esc"}
         self.use_hotkeys = tk.BooleanVar(value=True)
         self.playback_speed = tk.DoubleVar(value=1.0)
 
-        # Toggle hotkey can be a normal name ("f8") OR "scan:<code>"
+        # Toggle key: can be "f8" or "scan:<code>"
         self.play_toggle_key = tk.StringVar(value="f8")
 
+        # Repeat options
         self.repeat_enabled = tk.BooleanVar(value=False)
         self.repeat_delay_ms = tk.IntVar(value=250)
 
-        # NEW: capture-mode flag
+        # Capture-mode flag for setting toggle key
         self._capturing_toggle_key = False
 
+        # NEW: robust toggle detection (manual, via hook)
+        self.toggle_scan_code = None
+        self.toggle_key_name = None
+        self._toggle_pressed_guard = False
+        self._resolve_toggle_key()
+
+        # UI
         self._build_ui()
 
+        # Hook keyboard if possible
         if KEYBOARD_AVAILABLE:
             keyboard.hook(self._on_key_event)
-            self._setup_hotkeys()
+            self._setup_hotkeys()  # only F9/F10/ESC; toggle handled manually
         else:
             self.use_hotkeys.set(False)
             self._set_status("keyboard module not available. Recording hotkeys disabled.")
 
+        # Clean shutdown
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ---------------- Helpers: ms formatting ----------------
@@ -65,6 +79,25 @@ class MacroApp:
     def ms_int_to_sec(ms: int) -> float:
         return max(0, int(ms)) / 1000.0
 
+    def _resolve_toggle_key(self):
+        """
+        Parse play_toggle_key into either a scan code (best for dead keys) or a name.
+        Examples:
+          "scan:41" -> scan code 41
+          "f8"      -> name "f8"
+        """
+        val = str(self.play_toggle_key.get()).strip().lower()
+        self.toggle_scan_code = None
+        self.toggle_key_name = None
+
+        if val.startswith("scan:"):
+            try:
+                self.toggle_scan_code = int(val.split(":", 1)[1])
+            except Exception:
+                self.toggle_scan_code = None
+        elif val:
+            self.toggle_key_name = val
+
     # ---------------- UI ----------------
 
     def _build_ui(self):
@@ -73,6 +106,7 @@ class MacroApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
+        # Buttons row
         btns = ttk.Frame(frm)
         btns.grid(row=0, column=0, sticky="ew")
 
@@ -100,7 +134,7 @@ class MacroApp:
 
         self.chk_hotkeys = ttk.Checkbutton(
             opts,
-            text="Enable hotkeys (F9 record, F10 play, ESC stop playback)",
+            text="Enable hotkeys (F9 record, F10 play, ESC stop playback; toggle handled by manual hook)",
             variable=self.use_hotkeys,
             command=self._hotkeys_toggled
         )
@@ -123,7 +157,6 @@ class MacroApp:
         self.btn_apply_hotkey = ttk.Button(opts, text="Apply", command=self.apply_toggle_hotkey)
         self.btn_apply_hotkey.grid(row=2, column=2, padx=(0, 8), sticky="w", pady=(8, 0))
 
-        # NEW: capture button
         self.btn_capture_hotkey = ttk.Button(opts, text="Set (press key)", command=self.capture_toggle_hotkey)
         self.btn_capture_hotkey.grid(row=2, column=3, padx=(0, 8), sticky="w", pady=(8, 0))
 
@@ -162,6 +195,15 @@ class MacroApp:
 
         self.status = ttk.Label(frm, text="Ready.", anchor="w")
         self.status.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+
+        hint = (
+            "Toggle key works reliably even for dead keys (like ^) because it uses scan codes.\n"
+            "Use 'Set (press key)' to capture the key. Press once to start, again to stop.\n"
+            "Delays are edited in milliseconds."
+        )
+        ttk.Label(frm, text=hint, foreground="#555", anchor="w", justify="left").grid(
+            row=5, column=0, sticky="ew", pady=(8, 0)
+        )
 
         if not KEYBOARD_AVAILABLE:
             self.chk_hotkeys.state(["disabled"])
@@ -204,21 +246,39 @@ class MacroApp:
         self.btn_record.config(text="Start Recording")
         self._set_status(f"Recording OFF — captured {len(self.events)} steps.")
 
+    # ---------------- Key hook ----------------
+
     def _on_key_event(self, e):
-        # Capture toggle hotkey keypress if we are in "set hotkey" mode
+        # 1) Capture toggle hotkey (scan code) when in capture mode
         if self._capturing_toggle_key and e.event_type == "down":
-            # Use scan_code so dead keys work
             sc = getattr(e, "scan_code", None)
-            if sc is None:
-                # fallback: name, if available
+            if sc is not None:
+                self.root.after(0, lambda: self._finish_capture_toggle_key(f"scan:{sc}"))
+            else:
                 name = (e.name or "").lower()
                 if name:
                     self.root.after(0, lambda: self._finish_capture_toggle_key(name))
-                return
-            self.root.after(0, lambda: self._finish_capture_toggle_key(f"scan:{sc}"))
             return
 
-        # Normal recording
+        # 2) Manual toggle detection (robust; works even after other keys pressed)
+        if self.use_hotkeys.get():
+            is_toggle = False
+
+            if self.toggle_scan_code is not None and getattr(e, "scan_code", None) == self.toggle_scan_code:
+                is_toggle = True
+            elif self.toggle_scan_code is None and self.toggle_key_name and (e.name or "").lower() == self.toggle_key_name:
+                is_toggle = True
+
+            if is_toggle:
+                # Fire only on key DOWN, with guard to prevent repeats while held
+                if e.event_type == "down" and not self._toggle_pressed_guard:
+                    self._toggle_pressed_guard = True
+                    self.root.after(0, self.toggle_playback)
+                elif e.event_type == "up":
+                    self._toggle_pressed_guard = False
+                return
+
+        # 3) Normal macro recording
         if not self.recording or e.event_type != "down":
             return
 
@@ -344,7 +404,7 @@ class MacroApp:
         self._stop_playback.clear()
         self._play_thread = threading.Thread(target=self._play_worker, daemon=True)
         self._play_thread.start()
-        self._set_status("Playing... (toggle hotkey stops)")
+        self._set_status("Playing... (toggle key stops)")
 
     def _play_worker(self):
         speed = max(0.01, float(self.playback_speed.get()))
@@ -393,11 +453,10 @@ class MacroApp:
         self._set_status("Press the key you want to use as Play Toggle hotkey...")
 
     def _finish_capture_toggle_key(self, key_id: str):
-        # key_id is either "scan:<num>" or a key name
         self._capturing_toggle_key = False
-        self.play_toggle_key.set(key_id)
-        self._setup_hotkeys()
-        self._set_status(f"Play toggle hotkey set to: {key_id}")
+        self.play_toggle_key.set(str(key_id).strip().lower())
+        self._resolve_toggle_key()
+        self._set_status(f"Play toggle hotkey set to: {self.play_toggle_key.get()}")
 
     # ---------------- Save/Load/Clear ----------------
 
@@ -476,9 +535,11 @@ class MacroApp:
             tkey = str(data.get("play_toggle_key", "f8")).strip().lower()
             if tkey:
                 self.play_toggle_key.set(tkey)
+            self._resolve_toggle_key()
 
             for iid in self.tree.get_children():
                 self.tree.delete(iid)
+
             for i, ev in enumerate(self.events, start=1):
                 ms = self.sec_to_ms_int(ev["delay"])
                 self.tree.insert("", "end", values=(f"{i:03d}", ev["key"], str(ms)))
@@ -490,7 +551,7 @@ class MacroApp:
         except Exception as ex:
             messagebox.showerror("Load failed", str(ex))
 
-    # ---------------- Hotkeys ----------------
+    # ---------------- Hotkeys (F9/F10/ESC only) ----------------
 
     def apply_toggle_hotkey(self):
         if not KEYBOARD_AVAILABLE:
@@ -500,11 +561,13 @@ class MacroApp:
         if not key:
             messagebox.showerror("Invalid", "Toggle hotkey cannot be empty.")
             return
+
         self.play_toggle_key.set(key)
-        self._setup_hotkeys()
+        self._resolve_toggle_key()
         self._set_status(f"Applied play toggle hotkey: {key}")
 
     def _setup_hotkeys(self):
+        # Only set F9/F10/ESC here. Toggle key is handled in _on_key_event manually.
         try:
             keyboard.clear_all_hotkeys()
         except Exception:
@@ -516,18 +579,6 @@ class MacroApp:
         keyboard.add_hotkey("f9", lambda: self.root.after(0, self.toggle_recording))
         keyboard.add_hotkey("f10", lambda: self.root.after(0, self.play_macro))
         keyboard.add_hotkey("esc", lambda: self.root.after(0, self.stop_playback))
-
-        # Toggle key: support "scan:<num>"
-        tkey = str(self.play_toggle_key.get()).strip().lower() or "f8"
-        if tkey.startswith("scan:"):
-            try:
-                sc = int(tkey.split(":", 1)[1])
-                keyboard.add_hotkey(sc, lambda: self.root.after(0, self.toggle_playback))
-            except Exception:
-                # fallback: don't bind if invalid
-                pass
-        else:
-            keyboard.add_hotkey(tkey, lambda: self.root.after(0, self.toggle_playback))
 
     def _hotkeys_toggled(self):
         if not KEYBOARD_AVAILABLE:
@@ -548,7 +599,6 @@ class MacroApp:
             pass
         self.root.destroy()
 
-
 def main():
     root = tk.Tk()
     try:
@@ -561,7 +611,6 @@ def main():
     MacroApp(root)
     root.geometry("880x540")
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
